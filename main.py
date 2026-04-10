@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Mouse Painter
-Record your mouse journey, then watch it turn into glowing art.
+Click Galaxy
+Record where you click — watch it become a galaxy map.
+Dense click areas form bright star clusters; sparse areas drift like lone stars.
 
 macOS note: on first run, grant Accessibility access when prompted
 (System Settings → Privacy & Security → Accessibility).
@@ -10,7 +11,7 @@ import sys
 import os
 import math
 import time
-import colorsys
+import random
 import datetime
 import threading
 import subprocess
@@ -46,25 +47,17 @@ SCREEN_W, SCREEN_H = _screen_size()
 class MouseTracker:
     def __init__(self):
         self._lock      = threading.Lock()
-        self.positions: list[tuple[int, int, float]]       = []
-        self.clicks:    list[tuple[int, int, str, float]]  = []
+        self.clicks:    list[tuple[int, int, str, float]] = []
         self.recording  = False
         self.start_time: float | None = None
         self._listener  = None
 
     def reset(self):
         with self._lock:
-            self.positions  = []
             self.clicks     = []
             self.recording  = False
             self.start_time = None
         self._listener = None
-
-    def _on_move(self, x, y):
-        if self.recording:
-            t = time.time() - self.start_time
-            with self._lock:
-                self.positions.append((x, y, t))
 
     def _on_click(self, x, y, button, pressed):
         if self.recording and pressed:
@@ -74,10 +67,7 @@ class MouseTracker:
                 self.clicks.append((x, y, btn, t))
 
     def _start_listener(self):
-        self._listener = pynput_mouse.Listener(
-            on_move=self._on_move,
-            on_click=self._on_click,
-        )
+        self._listener = pynput_mouse.Listener(on_click=self._on_click)
         self._listener.start()
 
     def start(self):
@@ -99,8 +89,8 @@ class MouseTracker:
         """Restart listener if it died unexpectedly while recording."""
         if self.recording and not self.is_listener_alive():
             self._start_listener()
-            return False  # was dead, restarted
-        return True  # was alive
+            return False
+        return True
 
     @property
     def elapsed(self) -> float:
@@ -108,8 +98,7 @@ class MouseTracker:
 
     def snapshot(self):
         with self._lock:
-            return list(self.positions), list(self.clicks)
-
+            return list(self.clicks)
 
 
 # ── image generation ──────────────────────────────────────────────────────────
@@ -131,122 +120,178 @@ def _best_font(size: int):
     return ImageFont.load_default()
 
 
-def generate_art(positions, clicks, width, height) -> Image.Image:
-    BG = (60, 65, 120)
+def generate_art(clicks, width, height) -> Image.Image:
+    rng = random.Random(7)
+    BG  = (3, 3, 14)
+
     img = Image.new("RGBA", (width, height), BG + (255,))
 
-    n = len(positions)
+    # ── background star field ─────────────────────────────────────────────────
+    bg = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    bd = ImageDraw.Draw(bg)
+    for _ in range(2200):
+        x = rng.randint(0, width - 1)
+        y = rng.randint(0, height - 1)
+        a = rng.randint(15, 90)
+        if rng.random() < 0.75:
+            bd.point((x, y), fill=(190, 205, 255, a))
+        else:
+            bd.ellipse([x-1, y-1, x+1, y+1], fill=(210, 220, 255, a))
+    img = Image.alpha_composite(img, bg)
 
-    # ── glowing path ──────────────────────────────────────────────────────────
-    if n > 1:
-        # wide blurred glow
-        glow = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-        gd   = ImageDraw.Draw(glow)
-        for i in range(1, n):
-            t = i / n
-            r, g, b = [int(c * 255) for c in colorsys.hsv_to_rgb(t * 0.85, 0.75, 0.65)]
-            x1, y1 = int(positions[i-1][0]), int(positions[i-1][1])
-            x2, y2 = int(positions[i][0]),   int(positions[i][1])
-            gd.line([(x1, y1), (x2, y2)], fill=(r, g, b, 160), width=10)
-        img = Image.alpha_composite(img, glow.filter(ImageFilter.GaussianBlur(14)))
+    if not clicks:
+        return img.convert("RGB")
 
-        # crisp line on top
-        sharp = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-        sd    = ImageDraw.Draw(sharp)
-        for i in range(1, n):
-            t = i / n
-            r, g, b = [int(c * 255) for c in colorsys.hsv_to_rgb(t * 0.85, 1.0, 1.0)]
-            x1, y1 = int(positions[i-1][0]), int(positions[i-1][1])
-            x2, y2 = int(positions[i][0]),   int(positions[i][1])
-            sd.line([(x1, y1), (x2, y2)], fill=(r, g, b, 230), width=2)
-        img = Image.alpha_composite(img, sharp)
+    coords = [(int(cx), int(cy)) for cx, cy, _, _ in clicks]
+    n      = len(coords)
+    total_t = clicks[-1][3] if n > 0 else 1.0
 
-    # ── start / end markers ───────────────────────────────────────────────────
-    if n > 0:
-        d  = ImageDraw.Draw(img)
-        sx, sy = int(positions[0][0]),  int(positions[0][1])
-        ex, ey = int(positions[-1][0]), int(positions[-1][1])
-        d.polygon([(sx, sy-11), (sx+11, sy), (sx, sy+11), (sx-11, sy)],
-                  fill=(30, 255, 90, 220))
-        d.polygon([(ex, ey-11), (ex+11, ey), (ex, ey+11), (ex-11, ey)],
-                  fill=(255, 50, 50, 220))
+    # ── density score per click (neighbors within 130 px) ────────────────────
+    RADIUS = 130
+    densities = []
+    for i, (x1, y1) in enumerate(coords):
+        count = sum(
+            1 for j, (x2, y2) in enumerate(coords)
+            if i != j and math.hypot(x1 - x2, y1 - y2) < RADIUS
+        )
+        densities.append(count)
 
-    # ── glowing click dots ────────────────────────────────────────────────────
-    if clicks:
-        cg = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-        cd = ImageDraw.Draw(cg)
-        for cx, cy, btn, _ in clicks:
-            cx, cy = int(cx), int(cy)
-            gc = (20, 150, 255, 70) if btn == 'left' else (255, 100, 20, 70)
-            for r in (35, 22, 13):
-                cd.ellipse([cx-r, cy-r, cx+r, cy+r], fill=gc)
-        img = Image.alpha_composite(img, cg.filter(ImageFilter.GaussianBlur(16)))
+    max_d = max(densities) if max(densities) > 0 else 1
+    norm  = [d / max_d for d in densities]
 
-        dots = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-        dd   = ImageDraw.Draw(dots)
-        for cx, cy, btn, _ in clicks:
-            cx, cy = int(cx), int(cy)
-            if btn == 'left':
-                fill, rim = (70, 200, 255, 255), (210, 245, 255, 255)
+    # ── nebula / emission clouds (blurred, behind stars) ─────────────────────
+    nebula = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    nd     = ImageDraw.Draw(nebula)
+    for i, (cx, cy) in enumerate(coords):
+        d = norm[i]
+        if d < 0.08:
+            continue
+        t       = clicks[i][3] / total_t
+        r_ch    = int(30  + t  * 90)
+        g_ch    = int(10  + d  * 35)
+        b_ch    = int(100 + d  * 100)
+        alpha   = int(25  + d  * 70)
+        radius  = int(50  + d  * 130)
+        nd.ellipse([cx - radius, cy - radius, cx + radius, cy + radius],
+                   fill=(r_ch, g_ch, b_ch, alpha))
+    img = Image.alpha_composite(img, nebula.filter(ImageFilter.GaussianBlur(45)))
+
+    # ── satellite micro-stars around dense clusters ───────────────────────────
+    sat = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    sd  = ImageDraw.Draw(sat)
+    for i, (cx, cy) in enumerate(coords):
+        d      = norm[i]
+        n_sats = int(d * 30)
+        spread = int(25 + d * 100)
+        for _ in range(n_sats):
+            angle = rng.uniform(0, 2 * math.pi)
+            dist  = rng.uniform(6, spread)
+            sx    = int(cx + math.cos(angle) * dist)
+            sy    = int(cy + math.sin(angle) * dist)
+            if not (0 <= sx < width and 0 <= sy < height):
+                continue
+            a    = rng.randint(50, 175)
+            warm = rng.random()
+            rc   = int(170 + warm * 85)
+            gc   = int(185 + warm * 60)
+            bc   = int(230 - warm * 30)
+            sz   = rng.randint(0, 1)
+            if sz == 0:
+                sd.point((sx, sy), fill=(rc, gc, bc, a))
             else:
-                fill, rim = (255, 130, 45, 255), (255, 220, 170, 255)
-            dd.ellipse([cx-10, cy-10, cx+10, cy+10], fill=fill, outline=rim, width=2)
-            dd.ellipse([cx-3,  cy-3,  cx+3,  cy+3],  fill=(255, 255, 255, 255))
-        img = Image.alpha_composite(img, dots)
+                sd.ellipse([sx-1, sy-1, sx+1, sy+1], fill=(rc, gc, bc, a))
+    img = Image.alpha_composite(img, sat)
+
+    # ── per-star glow halo (blurred) ──────────────────────────────────────────
+    glow = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    gd   = ImageDraw.Draw(glow)
+    for i, (cx, cy) in enumerate(coords):
+        d   = norm[i]
+        t   = clicks[i][3] / total_t
+        rc  = int(140 + t * 115)
+        gc  = int(170 + t * 70)
+        bc  = int(255 - t * 85)
+        gr  = int(7 + d * 22)
+        a   = int(70 + d * 130)
+        gd.ellipse([cx - gr, cy - gr, cx + gr, cy + gr], fill=(rc, gc, bc, a))
+    img = Image.alpha_composite(img, glow.filter(ImageFilter.GaussianBlur(9)))
+
+    # ── sharp star cores + diffraction spikes ────────────────────────────────
+    stars = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    st    = ImageDraw.Draw(stars)
+    for i, (cx, cy) in enumerate(coords):
+        d   = norm[i]
+        t   = clicks[i][3] / total_t
+        rc  = int(195 + t * 60)
+        gc  = int(215 + t * 40)
+        bc  = int(255 - t * 65)
+        cr  = max(1, int(1 + d * 4))
+
+        # diffraction spikes
+        if d > 0.25:
+            slen  = int(8 + d * 28)
+            salpha = int(90 + d * 140)
+            scol  = (rc, gc, bc, salpha)
+            st.line([(cx - slen, cy), (cx + slen, cy)], fill=scol, width=1)
+            st.line([(cx, cy - slen), (cx, cy + slen)], fill=scol, width=1)
+            if d > 0.55:
+                diag = int(slen * 0.55)
+                st.line([(cx - diag, cy - diag), (cx + diag, cy + diag)],
+                        fill=scol, width=1)
+                st.line([(cx - diag, cy + diag), (cx + diag, cy - diag)],
+                        fill=scol, width=1)
+
+        # core disc
+        st.ellipse([cx - cr, cy - cr, cx + cr, cy + cr],
+                   fill=(rc, gc, bc, 255))
+        # white-hot centre
+        if cr >= 2:
+            st.ellipse([cx - 1, cy - 1, cx + 1, cy + 1],
+                       fill=(255, 255, 255, 255))
+
+    img = Image.alpha_composite(img, stars)
 
     # ── convert to RGB ────────────────────────────────────────────────────────
-    final = Image.new("RGB", (width, height), (60, 65, 120))
+    final = Image.new("RGB", (width, height), BG)
     final.paste(img, mask=img.split()[3])
     draw  = ImageDraw.Draw(final)
 
-    # ── stats overlay (top-left) ──────────────────────────────────────────────
-    dur        = positions[-1][2] if positions else 0
-    left_n     = sum(1 for c in clicks if c[2] == 'left')
-    right_n    = len(clicks) - left_n
-    total_px   = sum(
-        math.hypot(positions[i][0]-positions[i-1][0],
-                   positions[i][1]-positions[i-1][1])
-        for i in range(1, n)
-    )
+    # ── stats overlay ─────────────────────────────────────────────────────────
+    dur     = clicks[-1][3] if clicks else 0
+    left_n  = sum(1 for c in clicks if c[2] == 'left')
+    right_n = len(clicks) - left_n
+    hot     = sum(1 for d in norm if d > 0.5)
 
-    font_title  = _best_font(22)
-    font_body   = _best_font(15)
+    font_title = _best_font(22)
+    font_body  = _best_font(15)
 
     lines = [
-        ("Mouse Art",                                  (255, 220, 70),  font_title),
-        (f"Duration  {dur:.1f} s",                     (160, 210, 255), font_body),
-        (f"Points    {n:,}",                           (160, 210, 255), font_body),
-        (f"Distance  {total_px:,.0f} px",              (160, 210, 255), font_body),
-        (f"Clicks    {len(clicks)}   (L {left_n}  R {right_n})",
-                                                        (160, 210, 255), font_body),
-        (datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
-                                                        (100, 140, 180), font_body),
+        ("Click Galaxy",                                        (255, 220, 70),  font_title),
+        (f"Duration   {dur:.1f} s",                             (160, 210, 255), font_body),
+        (f"Clicks     {len(clicks)}   (L {left_n}  R {right_n})", (160, 210, 255), font_body),
+        (f"Hot spots  {hot}",                                   (160, 210, 255), font_body),
+        (datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),    (100, 140, 180), font_body),
     ]
 
     px, py = 22, 22
     for text, color, font in lines:
-        draw.text((px+1, py+1), text, fill=(0, 0, 0),  font=font)
-        draw.text((px,   py),   text, fill=color,       font=font)
+        draw.text((px + 1, py + 1), text, fill=(0, 0, 0), font=font)
+        draw.text((px,     py),     text, fill=color,      font=font)
         try:
             bbox = draw.textbbox((0, 0), text, font=font)
             py += (bbox[3] - bbox[1]) + 7
         except AttributeError:
             py += 22
 
-    # ── legend (bottom-right) ─────────────────────────────────────────────────
-    lx, ly = width - 170, height - 110
-    draw.ellipse([lx, ly, lx+14, ly+14], fill=(70, 200, 255))
-    draw.text((lx+20, ly-1), "Left click",  fill=(160, 210, 255), font=font_body)
-    draw.ellipse([lx, ly+26, lx+14, ly+40], fill=(255, 130, 45))
-    draw.text((lx+20, ly+25), "Right click", fill=(160, 210, 255), font=font_body)
-
-    # ── start / end legend ────────────────────────────────────────────────────
-    draw.polygon([(lx+7, ly+52), (lx+14, ly+59), (lx+7, ly+66), (lx, ly+59)],
-                 fill=(30, 255, 90))
-    draw.text((lx+20, ly+51), "Start",  fill=(160, 210, 255), font=font_body)
-    draw.polygon([(lx+7, ly+74), (lx+14, ly+81), (lx+7, ly+88), (lx, ly+81)],
-                 fill=(255, 50, 50))
-    draw.text((lx+20, ly+77), "End",    fill=(160, 210, 255), font=font_body)
+    # ── legend ────────────────────────────────────────────────────────────────
+    lx, ly    = width - 180, height - 80
+    font_body2 = _best_font(13)
+    draw.ellipse([lx, ly,     lx + 10, ly + 10], fill=(120, 190, 255))
+    draw.text((lx + 16, ly - 1),  "Early clicks",  fill=(140, 190, 255), font=font_body2)
+    draw.ellipse([lx, ly + 22, lx + 10, ly + 32], fill=(255, 240, 160))
+    draw.text((lx + 16, ly + 21), "Late clicks",   fill=(140, 190, 255), font=font_body2)
+    draw.ellipse([lx, ly + 44, lx + 10, ly + 54], fill=(180, 100, 255))
+    draw.text((lx + 16, ly + 43), "Dense cluster", fill=(140, 190, 255), font=font_body2)
 
     return final
 
@@ -272,36 +317,31 @@ class App:
 
     def _build_ui(self):
         self.root = tk.Tk()
-        self.root.title("Mouse Painter")
+        self.root.title("Click Galaxy")
         self.root.geometry("340x290")
         self.root.resizable(False, False)
         self.root.attributes("-topmost", True)
         self.root.configure(bg=DARK)
 
-        # title
-        tk.Label(self.root, text="✦  Mouse Painter  ✦",
+        tk.Label(self.root, text="✦  Click Galaxy  ✦",
                  font=("Helvetica", 17, "bold"),
                  fg=ACCENT, bg=DARK).pack(pady=(18, 3))
 
-        tk.Label(self.root, text="Move & click freely — we'll turn it into art",
+        tk.Label(self.root, text="Click anywhere — we'll map it like a galaxy",
                  font=("Helvetica", 10), fg=DIM, bg=DARK).pack()
 
-        # status
         self.status_var = tk.StringVar(value="Ready")
         tk.Label(self.root, textvariable=self.status_var,
                  font=("Helvetica", 11), fg="#aabbcc", bg=DARK).pack(pady=(12, 2))
 
-        # timer
         self.timer_var = tk.StringVar(value="00:00")
         tk.Label(self.root, textvariable=self.timer_var,
                  font=("Courier", 26, "bold"), fg=CYAN, bg=DARK).pack()
 
-        # live counters
         self.counter_var = tk.StringVar(value="")
         tk.Label(self.root, textvariable=self.counter_var,
                  font=("Helvetica", 10), fg=DIM, bg=DARK).pack(pady=(2, 0))
 
-        # button
         self.btn = tk.Button(
             self.root,
             text="▶   Start Recording",
@@ -314,9 +354,8 @@ class App:
         )
         self.btn.pack(pady=16)
 
-        # hint
         tk.Label(self.root,
-                 text="点击开始后窗口自动最小化\n鼠标轨迹全程后台记录",
+                 text="点击开始后窗口自动最小化\n点击越密集，星团越亮",
                  font=("Helvetica", 9), fg=DIM, bg=DARK, justify="center").pack()
 
     # ── recording control ─────────────────────────────────────────────────────
@@ -330,10 +369,9 @@ class App:
     def _start(self):
         self.is_recording = True
         self.tracker.start()
-        self.btn.config(text="■   Stop & Paint", bg=RED, activebackground="#aa2222")
-        self.status_var.set("Recording  •  move your mouse freely!")
+        self.btn.config(text="■   Stop & Render", bg=RED, activebackground="#aa2222")
+        self.status_var.set("Recording  •  click freely!")
         self._tick()
-        # Minimize so the user can work normally; tracking continues in background
         self.root.after(800, self.root.iconify)
 
     def _tick(self):
@@ -341,42 +379,41 @@ class App:
             return
         e = self.tracker.elapsed
         self.timer_var.set(f"{int(e//60):02d}:{int(e%60):02d}")
-        pos, clk = self.tracker.snapshot()
+        clk = self.tracker.snapshot()
 
         alive = self.tracker.ensure_listener()
         if not alive:
-            # Listener had died — show warning, it's been restarted
-            self.status_var.set("⚠️  Tracking interrupted — check Accessibility permission")
+            self.status_var.set("⚠️  Interrupted — check Accessibility permission")
         else:
-            self.status_var.set("Recording  •  move your mouse freely!")
+            self.status_var.set("Recording  •  click freely!")
 
-        self.counter_var.set(f"{len(pos):,} points  •  {len(clk)} clicks")
+        self.counter_var.set(f"{len(clk)} clicks recorded")
         self.root.after(400, self._tick)
 
     def _stop(self):
         self.is_recording = False
         self.tracker.stop()
-        positions, clicks = self.tracker.snapshot()
+        clicks = self.tracker.snapshot()
 
-        self.btn.config(state="disabled", text="Painting…", bg=MID)
-        self.status_var.set("Generating your artwork…")
+        self.btn.config(state="disabled", text="Rendering…", bg=MID)
+        self.status_var.set("Generating your galaxy…")
         self.counter_var.set("")
 
-        threading.Thread(target=self._generate, args=(positions, clicks),
+        threading.Thread(target=self._generate, args=(clicks,),
                          daemon=True).start()
 
     # ── art generation (background thread) ───────────────────────────────────
 
-    def _generate(self, positions, clicks):
-        if not positions:
+    def _generate(self, clicks):
+        if not clicks:
             self.root.after(0, lambda: messagebox.showinfo(
-                "Nothing recorded", "No mouse movement detected."))
+                "Nothing recorded", "No clicks detected."))
             self.root.after(0, self._reset_ui)
             return
 
-        img  = generate_art(positions, clicks, SCREEN_W, SCREEN_H)
+        img  = generate_art(clicks, SCREEN_W, SCREEN_H)
         ts   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(os.path.expanduser("~/Desktop"), f"mouse_art_{ts}.png")
+        path = os.path.join(os.path.expanduser("~/Desktop"), f"click_galaxy_{ts}.png")
         img.save(path)
 
         try:
@@ -389,17 +426,17 @@ class App:
         except Exception:
             pass
 
-        self.root.after(0, lambda: self._done(path, len(positions), len(clicks)))
+        self.root.after(0, lambda: self._done(path, len(clicks)))
 
-    def _done(self, path, n_pos, n_clk):
-        self.status_var.set("Your art is ready!")
+    def _done(self, path, n_clk):
+        self.status_var.set("Your galaxy is ready!")
         self.timer_var.set("00:00")
         self._reset_ui()
-        self.root.deiconify()   # restore window when art is ready
+        self.root.deiconify()
         self.root.lift()
         messagebox.showinfo(
-            "Mouse Art Complete!",
-            f"Recorded {n_pos:,} path points and {n_clk} clicks.\n\n"
+            "Click Galaxy Complete!",
+            f"Mapped {n_clk} clicks into a galaxy.\n\n"
             f"Saved to Desktop:\n{os.path.basename(path)}\n\n"
             "The image has been opened for you.",
         )
