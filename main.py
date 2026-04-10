@@ -142,12 +142,13 @@ def generate_art(clicks, width, height) -> Image.Image:
     if not clicks:
         return img.convert("RGB")
 
-    coords = [(int(cx), int(cy)) for cx, cy, _, _ in clicks]
-    n      = len(coords)
+    coords  = [(int(cx), int(cy)) for cx, cy, _, _ in clicks]
+    n       = len(coords)
     total_t = clicks[-1][3] if n > 0 else 1.0
 
-    # ── density score per click (neighbors within 130 px) ────────────────────
-    RADIUS = 130
+    # ── density score: neighbors within 250 px, log-scaled ───────────────────
+    # Log scaling handles huge dynamic ranges (10 clicks vs 10 000 clicks)
+    RADIUS = 250
     densities = []
     for i, (x1, y1) in enumerate(coords):
         count = sum(
@@ -157,99 +158,76 @@ def generate_art(clicks, width, height) -> Image.Image:
         densities.append(count)
 
     max_d = max(densities) if max(densities) > 0 else 1
-    norm  = [d / max_d for d in densities]
+    # log1p keeps zeros at 0, compresses the top end so sparse points still show
+    norm = [math.log1p(d) / math.log1p(max_d) for d in densities]
 
-    # ── nebula / emission clouds (blurred, behind stars) ─────────────────────
+    # ── color palette: deep blue (early) → vivid orange-gold (late) ──────────
+    def click_color(t_norm: float, alpha: int = 255) -> tuple:
+        # t=0 → (30, 90, 255)  t=1 → (255, 160, 20)
+        r = int(30  + t_norm * 225)
+        g = int(90  + t_norm * 70)
+        b = int(255 - t_norm * 235)
+        return (r, g, b, alpha)
+
+    # ── nebula glow (blurred clouds behind dots) ──────────────────────────────
     nebula = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     nd     = ImageDraw.Draw(nebula)
     for i, (cx, cy) in enumerate(coords):
         d = norm[i]
-        if d < 0.08:
+        if d < 0.05:
             continue
-        t       = clicks[i][3] / total_t
-        r_ch    = int(30  + t  * 90)
-        g_ch    = int(10  + d  * 35)
-        b_ch    = int(100 + d  * 100)
-        alpha   = int(25  + d  * 70)
-        radius  = int(50  + d  * 130)
+        t      = clicks[i][3] / total_t
+        rc, gc, bc, _ = click_color(t)
+        alpha  = int(18 + d * 55)
+        radius = int(40 + d * 150)
         nd.ellipse([cx - radius, cy - radius, cx + radius, cy + radius],
-                   fill=(r_ch, g_ch, b_ch, alpha))
-    img = Image.alpha_composite(img, nebula.filter(ImageFilter.GaussianBlur(45)))
+                   fill=(rc, gc, bc, alpha))
+    img = Image.alpha_composite(img, nebula.filter(ImageFilter.GaussianBlur(50)))
 
-    # ── satellite micro-stars around dense clusters ───────────────────────────
+    # ── satellite micro-dots around dense clusters ────────────────────────────
     sat = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     sd  = ImageDraw.Draw(sat)
     for i, (cx, cy) in enumerate(coords):
         d      = norm[i]
-        n_sats = int(d * 30)
-        spread = int(25 + d * 100)
+        n_sats = int(d * 28)
+        spread = int(20 + d * 110)
+        t      = clicks[i][3] / total_t
         for _ in range(n_sats):
             angle = rng.uniform(0, 2 * math.pi)
-            dist  = rng.uniform(6, spread)
+            dist  = rng.uniform(5, spread)
             sx    = int(cx + math.cos(angle) * dist)
             sy    = int(cy + math.sin(angle) * dist)
             if not (0 <= sx < width and 0 <= sy < height):
                 continue
-            a    = rng.randint(50, 175)
-            warm = rng.random()
-            rc   = int(170 + warm * 85)
-            gc   = int(185 + warm * 60)
-            bc   = int(230 - warm * 30)
-            sz   = rng.randint(0, 1)
-            if sz == 0:
-                sd.point((sx, sy), fill=(rc, gc, bc, a))
-            else:
-                sd.ellipse([sx-1, sy-1, sx+1, sy+1], fill=(rc, gc, bc, a))
+            a = rng.randint(40, 160)
+            rc, gc, bc, _ = click_color(t)
+            sd.point((sx, sy), fill=(rc, gc, bc, a))
     img = Image.alpha_composite(img, sat)
 
-    # ── per-star glow halo (blurred) ──────────────────────────────────────────
+    # ── soft per-dot glow (blurred) ───────────────────────────────────────────
     glow = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     gd   = ImageDraw.Draw(glow)
     for i, (cx, cy) in enumerate(coords):
-        d   = norm[i]
-        t   = clicks[i][3] / total_t
-        rc  = int(140 + t * 115)
-        gc  = int(170 + t * 70)
-        bc  = int(255 - t * 85)
-        gr  = int(7 + d * 22)
-        a   = int(70 + d * 130)
+        d  = norm[i]
+        t  = clicks[i][3] / total_t
+        gr = int(5 + d * 14)
+        a  = int(60 + d * 120)
+        rc, gc, bc, _ = click_color(t)
         gd.ellipse([cx - gr, cy - gr, cx + gr, cy + gr], fill=(rc, gc, bc, a))
-    img = Image.alpha_composite(img, glow.filter(ImageFilter.GaussianBlur(9)))
+    img = Image.alpha_composite(img, glow.filter(ImageFilter.GaussianBlur(7)))
 
-    # ── sharp star cores + diffraction spikes ────────────────────────────────
-    stars = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    st    = ImageDraw.Draw(stars)
+    # ── actual click dots: plain small circles, no spikes ────────────────────
+    dots = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    dt   = ImageDraw.Draw(dots)
     for i, (cx, cy) in enumerate(coords):
-        d   = norm[i]
-        t   = clicks[i][3] / total_t
-        rc  = int(195 + t * 60)
-        gc  = int(215 + t * 40)
-        bc  = int(255 - t * 65)
-        cr  = max(1, int(1 + d * 4))
-
-        # diffraction spikes
-        if d > 0.25:
-            slen  = int(8 + d * 28)
-            salpha = int(90 + d * 140)
-            scol  = (rc, gc, bc, salpha)
-            st.line([(cx - slen, cy), (cx + slen, cy)], fill=scol, width=1)
-            st.line([(cx, cy - slen), (cx, cy + slen)], fill=scol, width=1)
-            if d > 0.55:
-                diag = int(slen * 0.55)
-                st.line([(cx - diag, cy - diag), (cx + diag, cy + diag)],
-                        fill=scol, width=1)
-                st.line([(cx - diag, cy + diag), (cx + diag, cy - diag)],
-                        fill=scol, width=1)
-
-        # core disc
-        st.ellipse([cx - cr, cy - cr, cx + cr, cy + cr],
-                   fill=(rc, gc, bc, 255))
-        # white-hot centre
-        if cr >= 2:
-            st.ellipse([cx - 1, cy - 1, cx + 1, cy + 1],
-                       fill=(255, 255, 255, 255))
-
-    img = Image.alpha_composite(img, stars)
+        d  = norm[i]
+        t  = clicks[i][3] / total_t
+        rc, gc, bc, _ = click_color(t)
+        # radius 1 for sparse, up to 3 for the densest spots
+        cr = max(1, round(1 + d * 2))
+        dt.ellipse([cx - cr, cy - cr, cx + cr, cy + cr],
+                   fill=(rc, gc, bc, 220))
+    img = Image.alpha_composite(img, dots)
 
     # ── convert to RGB ────────────────────────────────────────────────────────
     final = Image.new("RGB", (width, height), BG)
