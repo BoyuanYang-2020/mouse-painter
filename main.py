@@ -73,21 +73,34 @@ class MouseTracker:
             with self._lock:
                 self.clicks.append((x, y, btn, t))
 
-    def start(self):
-        self.reset()
-        self.start_time = time.time()
-        self.recording  = True
-        self._listener  = pynput_mouse.Listener(
+    def _start_listener(self):
+        self._listener = pynput_mouse.Listener(
             on_move=self._on_move,
             on_click=self._on_click,
         )
         self._listener.start()
+
+    def start(self):
+        self.reset()
+        self.start_time = time.time()
+        self.recording  = True
+        self._start_listener()
 
     def stop(self):
         self.recording = False
         if self._listener:
             self._listener.stop()
             self._listener = None
+
+    def is_listener_alive(self) -> bool:
+        return self._listener is not None and self._listener.is_alive()
+
+    def ensure_listener(self):
+        """Restart listener if it died unexpectedly while recording."""
+        if self.recording and not self.is_listener_alive():
+            self._start_listener()
+            return False  # was dead, restarted
+        return True  # was alive
 
     @property
     def elapsed(self) -> float:
@@ -329,6 +342,14 @@ class App:
         e = self.tracker.elapsed
         self.timer_var.set(f"{int(e//60):02d}:{int(e%60):02d}")
         pos, clk = self.tracker.snapshot()
+
+        alive = self.tracker.ensure_listener()
+        if not alive:
+            # Listener had died — show warning, it's been restarted
+            self.status_var.set("⚠️  Tracking interrupted — check Accessibility permission")
+        else:
+            self.status_var.set("Recording  •  move your mouse freely!")
+
         self.counter_var.set(f"{len(pos):,} points  •  {len(clk)} clicks")
         self.root.after(400, self._tick)
 
