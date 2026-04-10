@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mouse Painter ✦</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            background: #0d0d1a;
+            font-family: -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif;
+            overflow: hidden;
+            height: 100vh;
+            width: 100vw;
+            user-select: none;
+        }
+
+        #canvas {
+            position: fixed;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            cursor: crosshair;
+            touch-action: none;
+        }
+
+        #panel {
+            position: fixed;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(10, 10, 26, 0.88);
+            backdrop-filter: blur(14px);
+            -webkit-backdrop-filter: blur(14px);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 16px;
+            padding: 22px 34px;
+            text-align: center;
+            z-index: 100;
+            min-width: 300px;
+            box-shadow: 0 8px 40px rgba(0, 0, 0, 0.55);
+            transition: opacity 0.3s, transform 0.3s;
+        }
+
+        #panel.collapsed {
+            padding: 12px 20px;
+            min-width: unset;
+        }
+
+        h1 {
+            color: #ffdc50;
+            font-size: 19px;
+            font-weight: bold;
+            letter-spacing: 0.4px;
+            margin-bottom: 4px;
+        }
+
+        .subtitle {
+            color: #445566;
+            font-size: 12px;
+            margin-bottom: 14px;
+        }
+
+        .status {
+            color: #aabbcc;
+            font-size: 13px;
+            margin-bottom: 8px;
+            min-height: 18px;
+        }
+
+        .timer {
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 38px;
+            font-weight: bold;
+            color: #44ddff;
+            letter-spacing: 3px;
+            margin-bottom: 4px;
+        }
+
+        .counter {
+            color: #445566;
+            font-size: 12px;
+            margin-bottom: 16px;
+            min-height: 16px;
+        }
+
+        .btn-row {
+            display: flex;
+            gap: 10px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+
+        button {
+            font-size: 13px;
+            font-weight: bold;
+            padding: 9px 22px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: background 0.15s, transform 0.1s;
+            letter-spacing: 0.2px;
+        }
+
+        button:active { transform: scale(0.97); }
+
+        #btn-start  { background: #1a7a2e; color: #fff; }
+        #btn-start:hover  { background: #22943a; }
+
+        #btn-stop   { background: #8b1a1a; color: #fff; display: none; }
+        #btn-stop:hover   { background: #aa2222; }
+
+        #btn-download { background: #1a4a8b; color: #fff; display: none; }
+        #btn-download:hover { background: #2255aa; }
+
+        #btn-new { background: #2a2a44; color: #aabbcc; display: none; }
+        #btn-new:hover { background: #383855; }
+
+        /* Hint strip shown during recording */
+        #hint {
+            position: fixed;
+            bottom: 18px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(10, 10, 26, 0.7);
+            color: #445566;
+            font-size: 12px;
+            padding: 6px 18px;
+            border-radius: 20px;
+            z-index: 100;
+            display: none;
+            pointer-events: none;
+            white-space: nowrap;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="canvas"></canvas>
+
+    <div id="panel">
+        <h1>✦&nbsp; Mouse Painter &nbsp;✦</h1>
+        <div class="subtitle">Move &amp; click freely — we'll turn it into art</div>
+        <div class="status" id="status">Ready</div>
+        <div class="timer"  id="timer">00:00</div>
+        <div class="counter" id="counter">&nbsp;</div>
+        <div class="btn-row">
+            <button id="btn-start">▶&nbsp; Start Recording</button>
+            <button id="btn-stop">■&nbsp; Stop &amp; Paint</button>
+            <button id="btn-download">↓&nbsp; Download PNG</button>
+            <button id="btn-new">↺&nbsp; New Recording</button>
+        </div>
+    </div>
+
+    <div id="hint">Move your mouse anywhere on this page &nbsp;•&nbsp; Click to mark points</div>
+
+    <script>
+    (() => {
+        // ── elements ──────────────────────────────────────────────────────────
+        const canvas  = document.getElementById('canvas');
+        const ctx     = canvas.getContext('2d');
+        const panel   = document.getElementById('panel');
+        const hint    = document.getElementById('hint');
+        const statusEl  = document.getElementById('status');
+        const timerEl   = document.getElementById('timer');
+        const counterEl = document.getElementById('counter');
+        const btnStart    = document.getElementById('btn-start');
+        const btnStop     = document.getElementById('btn-stop');
+        const btnDownload = document.getElementById('btn-download');
+        const btnNew      = document.getElementById('btn-new');
+
+        // ── constants ─────────────────────────────────────────────────────────
+        const BG = [60, 65, 120];   // matches updated Python app
+
+        // ── state ─────────────────────────────────────────────────────────────
+        let recording  = false;
+        let positions  = [];   // {x, y, t}
+        let clicks     = [];   // {x, y, button, t}
+        let startTime  = null;
+        let timerInt   = null;
+        let lastPos    = null;
+
+        // ── canvas resize ─────────────────────────────────────────────────────
+        function resize() {
+            canvas.width  = window.innerWidth;
+            canvas.height = window.innerHeight;
+            if (!recording) drawBg();
+        }
+        window.addEventListener('resize', resize);
+        resize();
+        drawBg();
+
+        function drawBg() {
+            ctx.shadowBlur = 0;
+            ctx.fillStyle  = `rgb(${BG.join(',')})`;
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+        }
+
+        // ── color helpers ─────────────────────────────────────────────────────
+        function hsvToRgb(h, s, v) {
+            const i = Math.floor(h * 6);
+            const f = h * 6 - i;
+            const p = v * (1 - s), q = v * (1 - f * s), t = v * (1 - (1 - f) * s);
+            let r, g, b;
+            switch (i % 6) {
+                case 0: r=v;g=t;b=p; break; case 1: r=q;g=v;b=p; break;
+                case 2: r=p;g=v;b=t; break; case 3: r=p;g=q;b=v; break;
+                case 4: r=t;g=p;b=v; break; case 5: r=v;g=p;b=q; break;
+            }
+            return [r*255|0, g*255|0, b*255|0];
+        }
+
+        // ── live trace helpers ────────────────────────────────────────────────
+        function traceLine(prev, curr, t) {
+            const hue = (t * 0.04) % 0.85;
+            const [r, g, b] = hsvToRgb(hue, 1.0, 1.0);
+            ctx.beginPath();
+            ctx.moveTo(prev.x, prev.y);
+            ctx.lineTo(curr.x, curr.y);
+            ctx.strokeStyle = `rgba(${r},${g},${b},0.9)`;
+            ctx.lineWidth   = 2;
+            ctx.lineCap     = 'round';
+            ctx.shadowBlur  = 8;
+            ctx.shadowColor = `rgba(${r},${g},${b},0.7)`;
+            ctx.stroke();
+            ctx.shadowBlur  = 0;
+        }
+
+        // ── mouse events ──────────────────────────────────────────────────────
+        canvas.addEventListener('mousemove', e => {
+            if (!recording) return;
+            const t   = (Date.now() - startTime) / 1000;
+            const pos = { x: e.clientX, y: e.clientY, t };
+            positions.push(pos);
+            if (lastPos) traceLine(lastPos, pos, t);
+            lastPos = pos;
+        });
+
+        canvas.addEventListener('mousedown', e => {
+            if (!recording) return;
+            e.preventDefault();
+            clicks.push({
+                x: e.clientX, y: e.clientY,
+                button: e.button === 0 ? 'left' : 'right',
+                t: (Date.now() - startTime) / 1000
+            });
+        });
+
+        canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+        // ── touch events ──────────────────────────────────────────────────────
+        canvas.addEventListener('touchstart', e => {
+            if (!recording) return;
+            e.preventDefault();
+            const touch = e.touches[0];
+            clicks.push({
+                x: touch.clientX, y: touch.clientY, button: 'left',
+                t: (Date.now() - startTime) / 1000
+            });
+        }, { passive: false });
+
+        canvas.addEventListener('touchmove', e => {
+            if (!recording) return;
+            e.preventDefault();
+            const touch = e.touches[0];
+            const t   = (Date.now() - startTime) / 1000;
+            const pos = { x: touch.clientX, y: touch.clientY, t };
+            positions.push(pos);
+            if (lastPos) traceLine(lastPos, pos, t);
+            lastPos = pos;
+        }, { passive: false });
+
+        // ── recording control ─────────────────────────────────────────────────
+        function startRecording() {
+            recording  = true;
+            positions  = [];
+            clicks     = [];
+            startTime  = Date.now();
+            lastPos    = null;
+
+            drawBg();
+
+            btnStart.style.display    = 'none';
+            btnStop.style.display     = '';
+            btnDownload.style.display = 'none';
+            btnNew.style.display      = 'none';
+            hint.style.display        = 'block';
+
+            statusEl.textContent  = 'Recording  •  move your mouse!';
+            timerEl.textContent   = '00:00';
+            counterEl.textContent = '\u00a0';
+
+            timerInt = setInterval(() => {
+                const e = (Date.now() - startTime) / 1000;
+                const m = (e / 60 | 0), s = (e % 60 | 0);
+                timerEl.textContent   = `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+                counterEl.textContent = `${positions.length.toLocaleString()} points  •  ${clicks.length} clicks`;
+            }, 400);
+        }
+
+        function stopRecording() {
+            recording = false;
+            clearInterval(timerInt);
+            hint.style.display     = 'none';
+            btnStop.style.display  = 'none';
+            statusEl.textContent   = 'Generating your artwork…';
+            counterEl.textContent  = '\u00a0';
+
+            // yield to the browser to repaint the UI message, then render
+            requestAnimationFrame(() => setTimeout(() => {
+                renderArt();
+                btnDownload.style.display = '';
+                btnNew.style.display      = '';
+                statusEl.textContent      = 'Your art is ready!';
+            }, 30));
+        }
+
+        // ── final render ──────────────────────────────────────────────────────
+        function renderArt() {
+            const W = canvas.width, H = canvas.height;
+            const n = positions.length;
+
+            ctx.shadowBlur = 0;
+            drawBg();
+
+            if (n > 1) {
+                ctx.lineCap    = 'round';
+                ctx.lineJoin   = 'round';
+                const BATCH    = 12;
+
+                // --- glow pass (thick + blurred via shadow) ---
+                for (let i = 1; i < n; i += BATCH) {
+                    const end = Math.min(i + BATCH, n);
+                    const [r, g, b] = hsvToRgb((i / n) * 0.85, 0.75, 0.65);
+                    ctx.beginPath();
+                    ctx.moveTo(positions[i-1].x, positions[i-1].y);
+                    for (let j = i; j < end; j++)
+                        ctx.lineTo(positions[j].x, positions[j].y);
+                    ctx.strokeStyle = `rgba(${r},${g},${b},0.6)`;
+                    ctx.lineWidth   = 10;
+                    ctx.shadowBlur  = 28;
+                    ctx.shadowColor = `rgba(${r},${g},${b},0.8)`;
+                    ctx.stroke();
+                }
+
+                // --- crisp pass ---
+                ctx.shadowBlur = 0;
+                for (let i = 1; i < n; i += BATCH) {
+                    const end = Math.min(i + BATCH, n);
+                    const [r, g, b] = hsvToRgb((i / n) * 0.85, 1.0, 1.0);
+                    ctx.beginPath();
+                    ctx.moveTo(positions[i-1].x, positions[i-1].y);
+                    for (let j = i; j < end; j++)
+                        ctx.lineTo(positions[j].x, positions[j].y);
+                    ctx.strokeStyle = `rgba(${r},${g},${b},0.9)`;
+                    ctx.lineWidth   = 2;
+                    ctx.stroke();
+                }
+            }
+
+            // --- click dots ---
+            ctx.shadowBlur = 0;
+            for (const c of clicks) {
+                const [cr, cg, cb] = c.button === 'left' ? [70,200,255] : [255,130,45];
+
+                // radial glow
+                const grad = ctx.createRadialGradient(c.x, c.y, 0, c.x, c.y, 35);
+                grad.addColorStop(0, `rgba(${cr},${cg},${cb},0.5)`);
+                grad.addColorStop(1, `rgba(${cr},${cg},${cb},0)`);
+                ctx.fillStyle = grad;
+                ctx.beginPath(); ctx.arc(c.x, c.y, 35, 0, Math.PI*2); ctx.fill();
+
+                // filled dot
+                ctx.beginPath(); ctx.arc(c.x, c.y, 10, 0, Math.PI*2);
+                ctx.fillStyle   = `rgb(${cr},${cg},${cb})`;
+                ctx.shadowBlur  = 12;
+                ctx.shadowColor = `rgba(${cr},${cg},${cb},0.9)`;
+                ctx.fill();
+                ctx.shadowBlur  = 0;
+
+                // white centre
+                ctx.beginPath(); ctx.arc(c.x, c.y, 3, 0, Math.PI*2);
+                ctx.fillStyle = '#fff'; ctx.fill();
+            }
+
+            // --- start / end markers ---
+            if (n > 0) {
+                diamond(positions[0].x,   positions[0].y,   11, 'rgba(30,255,90,0.86)');
+                diamond(positions[n-1].x, positions[n-1].y, 11, 'rgba(255,50,50,0.86)');
+            }
+
+            drawStats();
+            drawLegend();
+        }
+
+        // ── diamond marker ────────────────────────────────────────────────────
+        function diamond(x, y, r, color) {
+            ctx.shadowBlur = 0;
+            ctx.beginPath();
+            ctx.moveTo(x, y-r); ctx.lineTo(x+r, y);
+            ctx.lineTo(x, y+r); ctx.lineTo(x-r, y);
+            ctx.closePath();
+            ctx.fillStyle = color;
+            ctx.fill();
+        }
+
+        // ── stats overlay (top-left) ──────────────────────────────────────────
+        function drawStats() {
+            const n   = positions.length;
+            const dur = n > 0 ? positions[n-1].t : 0;
+            const lN  = clicks.filter(c => c.button === 'left').length;
+            const rN  = clicks.length - lN;
+            let dist  = 0;
+            for (let i = 1; i < n; i++)
+                dist += Math.hypot(positions[i].x - positions[i-1].x,
+                                   positions[i].y - positions[i-1].y);
+
+            const now = new Date();
+            const p2  = v => String(v).padStart(2,'0');
+            const ds  = `${now.getFullYear()}-${p2(now.getMonth()+1)}-${p2(now.getDate())} ${p2(now.getHours())}:${p2(now.getMinutes())}`;
+
+            const lines = [
+                { text: 'Mouse Art',                                         color: '#ffdc46', bold: true,  size: 22 },
+                { text: `Duration  ${dur.toFixed(1)} s`,                     color: '#a0d2ff', bold: false, size: 15 },
+                { text: `Points    ${n.toLocaleString()}`,                   color: '#a0d2ff', bold: false, size: 15 },
+                { text: `Distance  ${Math.round(dist).toLocaleString()} px`, color: '#a0d2ff', bold: false, size: 15 },
+                { text: `Clicks    ${clicks.length}   (L ${lN}  R ${rN})`,  color: '#a0d2ff', bold: false, size: 15 },
+                { text: ds,                                                   color: '#648cb4', bold: false, size: 15 },
+            ];
+
+            ctx.shadowBlur = 0;
+            let py = 22;
+            for (const l of lines) {
+                ctx.font = `${l.bold ? 'bold ' : ''}${l.size}px Helvetica, Arial, sans-serif`;
+                const ty = py + l.size;
+                ctx.fillStyle = 'rgba(0,0,0,0.75)';
+                ctx.fillText(l.text, 23, ty + 1);
+                ctx.fillStyle = l.color;
+                ctx.fillText(l.text, 22, ty);
+                py += l.size + 7;
+            }
+        }
+
+        // ── legend (bottom-right) ─────────────────────────────────────────────
+        function drawLegend() {
+            const lx = canvas.width  - 170;
+            const ly = canvas.height - 110;
+
+            ctx.shadowBlur = 0;
+            ctx.font = '15px Helvetica, Arial, sans-serif';
+
+            const items = [
+                { dy:  0, color:[70,200,255],  label:'Left click',  type:'circle'  },
+                { dy: 26, color:[255,130,45],  label:'Right click', type:'circle'  },
+                { dy: 52, color:[30,255,90],   label:'Start',       type:'diamond' },
+                { dy: 74, color:[255,50,50],   label:'End',         type:'diamond' },
+            ];
+
+            for (const item of items) {
+                const [r, g, b] = item.color;
+                const ix = lx + 7, iy = ly + item.dy + 7;
+                if (item.type === 'circle') {
+                    ctx.beginPath(); ctx.arc(ix, iy, 7, 0, Math.PI*2);
+                    ctx.fillStyle = `rgb(${r},${g},${b})`; ctx.fill();
+                } else {
+                    diamond(ix, iy, 7, `rgb(${r},${g},${b})`);
+                }
+                ctx.fillStyle = 'rgba(0,0,0,0.75)';
+                ctx.fillText(item.label, lx + 21, ly + item.dy + 15 + 1);
+                ctx.fillStyle = '#a0d2ff';
+                ctx.fillText(item.label, lx + 20, ly + item.dy + 15);
+            }
+        }
+
+        // ── download PNG ──────────────────────────────────────────────────────
+        function downloadPng() {
+            const now = new Date();
+            const p2  = v => String(v).padStart(2, '0');
+            const ts  = `${now.getFullYear()}${p2(now.getMonth()+1)}${p2(now.getDate())}_${p2(now.getHours())}${p2(now.getMinutes())}${p2(now.getSeconds())}`;
+            const a   = document.createElement('a');
+            a.download = `mouse_art_${ts}.png`;
+            a.href     = canvas.toDataURL('image/png');
+            a.click();
+        }
+
+        // ── new recording ─────────────────────────────────────────────────────
+        function resetUI() {
+            btnStart.style.display    = '';
+            btnStop.style.display     = 'none';
+            btnDownload.style.display = 'none';
+            btnNew.style.display      = 'none';
+            statusEl.textContent      = 'Ready';
+            timerEl.textContent       = '00:00';
+            counterEl.textContent     = '\u00a0';
+            drawBg();
+        }
+
+        // ── button listeners ──────────────────────────────────────────────────
+        btnStart.addEventListener('click',    startRecording);
+        btnStop.addEventListener('click',     stopRecording);
+        btnDownload.addEventListener('click', downloadPng);
+        btnNew.addEventListener('click',      resetUI);
+    })();
+    </script>
+</body>
+</html>
