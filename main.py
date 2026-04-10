@@ -161,28 +161,54 @@ def generate_art(clicks, width, height) -> Image.Image:
     # log1p keeps zeros at 0, compresses the top end so sparse points still show
     norm = [math.log1p(d) / math.log1p(max_d) for d in densities]
 
-    # ── color palette: deep blue (early) → vivid orange-gold (late) ──────────
-    def click_color(t_norm: float, alpha: int = 255) -> tuple:
-        # t=0 → (30, 90, 255)  t=1 → (255, 160, 20)
-        r = int(30  + t_norm * 225)
-        g = int(90  + t_norm * 70)
-        b = int(255 - t_norm * 235)
-        return (r, g, b, alpha)
+    # ── color palette: stellar life cycle (t=0 oldest → t=1 youngest) ────────
+    # Mapped to stellar evolution colors by surface temperature:
+    #   t=0  oldest  → cooling remnant / dying red star   (~2 500 K)
+    #   t=0.18       → red giant                          (~3 500 K)
+    #   t=0.38       → K-type aging main sequence         (~4 500 K)
+    #   t=0.58       → G-type sun-like                    (~5 800 K)
+    #   t=0.76       → F-type yellow-white                (~7 000 K)
+    #   t=0.90       → A-type blue-white                  (~9 000 K)
+    #   t=1.0 youngest → B-type hot blue                  (~20 000 K)
+    _COLOR_STOPS = [
+        (0.00, (175,  65,  35)),   # dim orange-red     (cooling remnant)
+        (0.18, (220,  55,  15)),   # red-orange         (red giant)
+        (0.38, (255, 140,  35)),   # orange             (K-type)
+        (0.58, (255, 225, 100)),   # yellow             (G-type / sun)
+        (0.76, (255, 248, 210)),   # warm white-yellow  (F-type)
+        (0.90, (200, 220, 255)),   # blue-white         (A-type)
+        (1.00, (110, 155, 255)),   # hot blue           (B-type, youngest)
+    ]
 
-    # ── nebula glow (blurred clouds behind dots) ──────────────────────────────
+    def click_color(t_norm: float, alpha: int = 255) -> tuple:
+        t_norm = max(0.0, min(1.0, t_norm))
+        for k in range(len(_COLOR_STOPS) - 1):
+            t0, c0 = _COLOR_STOPS[k]
+            t1, c1 = _COLOR_STOPS[k + 1]
+            if t_norm <= t1:
+                f = (t_norm - t0) / (t1 - t0)
+                r = int(c0[0] + f * (c1[0] - c0[0]))
+                g = int(c0[1] + f * (c1[1] - c0[1]))
+                b = int(c0[2] + f * (c1[2] - c0[2]))
+                return (r, g, b, alpha)
+        return (_COLOR_STOPS[-1][1][0], _COLOR_STOPS[-1][1][1],
+                _COLOR_STOPS[-1][1][2], alpha)
+
+    # ── nebula glow (blurred clouds behind dots) — kept subtle ───────────────
     nebula = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     nd     = ImageDraw.Draw(nebula)
     for i, (cx, cy) in enumerate(coords):
         d = norm[i]
         if d < 0.05:
             continue
+        d_vis  = d ** 1.8
         t      = clicks[i][3] / total_t
         rc, gc, bc, _ = click_color(t)
-        alpha  = int(18 + d * 55)
-        radius = int(40 + d * 150)
+        alpha  = int(d_vis * 55)           # was 130 — much lighter
+        radius = int(30 + d_vis * 180)
         nd.ellipse([cx - radius, cy - radius, cx + radius, cy + radius],
                    fill=(rc, gc, bc, alpha))
-    img = Image.alpha_composite(img, nebula.filter(ImageFilter.GaussianBlur(50)))
+    img = Image.alpha_composite(img, nebula.filter(ImageFilter.GaussianBlur(45)))
 
     # ── satellite micro-dots around dense clusters ────────────────────────────
     sat = Image.new("RGBA", (width, height), (0, 0, 0, 0))
@@ -199,34 +225,47 @@ def generate_art(clicks, width, height) -> Image.Image:
             sy    = int(cy + math.sin(angle) * dist)
             if not (0 <= sx < width and 0 <= sy < height):
                 continue
-            a = rng.randint(40, 160)
+            a = rng.randint(20, 80)        # was 40–160 — more transparent
             rc, gc, bc, _ = click_color(t)
             sd.point((sx, sy), fill=(rc, gc, bc, a))
     img = Image.alpha_composite(img, sat)
 
-    # ── soft per-dot glow (blurred) ───────────────────────────────────────────
+    # ── soft per-dot glow (blurred) — kept light ─────────────────────────────
     glow = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     gd   = ImageDraw.Draw(glow)
     for i, (cx, cy) in enumerate(coords):
-        d  = norm[i]
-        t  = clicks[i][3] / total_t
-        gr = int(5 + d * 14)
-        a  = int(60 + d * 120)
+        d      = norm[i]
+        d_vis  = d ** 1.5
+        t      = clicks[i][3] / total_t
+        gr     = int(3 + d_vis * 16)
+        a      = int(20 + d_vis * 70)      # was 50+170 — much lighter
         rc, gc, bc, _ = click_color(t)
         gd.ellipse([cx - gr, cy - gr, cx + gr, cy + gr], fill=(rc, gc, bc, a))
-    img = Image.alpha_composite(img, glow.filter(ImageFilter.GaussianBlur(7)))
+    img = Image.alpha_composite(img, glow.filter(ImageFilter.GaussianBlur(5)))
 
-    # ── actual click dots: plain small circles, no spikes ────────────────────
+    # ── nucleus blaze: tight white glow for the very densest clusters ─────────
+    blaze = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    bzd   = ImageDraw.Draw(blaze)
+    for i, (cx, cy) in enumerate(coords):
+        d = norm[i]
+        if d < 0.72:
+            continue
+        d_b = (d - 0.72) / 0.28
+        r_b = int(2 + d_b * 12)
+        a_b = int(d_b ** 1.5 * 100)        # was 210 — lighter
+        bzd.ellipse([cx - r_b, cy - r_b, cx + r_b, cy + r_b],
+                    fill=(240, 248, 255, a_b))
+    img = Image.alpha_composite(img, blaze.filter(ImageFilter.GaussianBlur(4)))
+
+    # ── actual click dots: white/grey, 1 px — same scale as background stars ─
     dots = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     dt   = ImageDraw.Draw(dots)
     for i, (cx, cy) in enumerate(coords):
         d  = norm[i]
-        t  = clicks[i][3] / total_t
-        rc, gc, bc, _ = click_color(t)
-        # radius 1 for sparse, up to 3 for the densest spots
-        cr = max(1, round(1 + d * 2))
-        dt.ellipse([cx - cr, cy - cr, cx + cr, cy + cr],
-                   fill=(rc, gc, bc, 220))
+        # all dots are white-grey; denser ones are slightly brighter
+        brightness = int(180 + d * 60)     # 180–240 grey range
+        a_dot      = int(160 + d * 70)
+        dt.point((cx, cy), fill=(brightness, brightness, brightness + 10, a_dot))
     img = Image.alpha_composite(img, dots)
 
     # ── convert to RGB ────────────────────────────────────────────────────────
@@ -261,15 +300,31 @@ def generate_art(clicks, width, height) -> Image.Image:
         except AttributeError:
             py += 22
 
-    # ── legend ────────────────────────────────────────────────────────────────
-    lx, ly    = width - 180, height - 80
+    # ── color bar legend (continuous time gradient) ───────────────────────────
     font_body2 = _best_font(13)
-    draw.ellipse([lx, ly,     lx + 10, ly + 10], fill=(120, 190, 255))
-    draw.text((lx + 16, ly - 1),  "Early clicks",  fill=(140, 190, 255), font=font_body2)
-    draw.ellipse([lx, ly + 22, lx + 10, ly + 32], fill=(255, 240, 160))
-    draw.text((lx + 16, ly + 21), "Late clicks",   fill=(140, 190, 255), font=font_body2)
-    draw.ellipse([lx, ly + 44, lx + 10, ly + 54], fill=(180, 100, 255))
-    draw.text((lx + 16, ly + 43), "Dense cluster", fill=(140, 190, 255), font=font_body2)
+    bar_w, bar_h = 14, 120
+    bar_x = width - 50
+    bar_y = height - bar_h - 40
+
+    # draw gradient bar pixel-row by pixel-row
+    for row in range(bar_h):
+        t_row = row / (bar_h - 1)          # 0 = top = early, 1 = bottom = late
+        rc, gc, bc, _ = click_color(t_row)
+        draw.rectangle([bar_x, bar_y + row, bar_x + bar_w, bar_y + row],
+                       fill=(rc, gc, bc))
+
+    # thin white border around bar
+    draw.rectangle([bar_x - 1, bar_y - 1, bar_x + bar_w + 1, bar_y + bar_h + 1],
+                   outline=(200, 200, 200))
+
+    # labels
+    draw.text((bar_x - 60, bar_y - 2),         "Oldest", fill=(180, 210, 255), font=font_body2)
+    draw.text((bar_x - 62, bar_y + bar_h - 2), "Youngest", fill=(180, 210, 255), font=font_body2)
+
+    # tick marks at 25 %, 50 %, 75 %
+    for frac in (0.25, 0.50, 0.75):
+        ty = bar_y + int(frac * bar_h)
+        draw.line([bar_x + bar_w + 1, ty, bar_x + bar_w + 5, ty], fill=(180, 180, 180))
 
     return final
 
